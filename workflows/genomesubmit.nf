@@ -110,8 +110,63 @@ workflow GENOMESUBMIT {
         }
         .mix(branched_coverage_results.genome_coverage_present)
 
+    // --------- Taxonomy
+    branched_taxonomy_results = fasta_updated_with_coverage
+        .branch { meta, _fasta ->
+            genome_taxonomy_input: !(meta.NCBI_lineage)
+            taxonomy_present: true  // Everything else goes here
+        }
+
+    // Change extension for all files required taxonomy to .fasta because CATPACK requires suffix as input
+    RENAME_FASTA_FOR_CATPACK (
+        branched_taxonomy_results.genome_taxonomy_input
+    )
+
+    // build input structures for CAT_DB depending on what provided as input
+    def cat_db_input = cat_db
+        ? channel.of( [['id': 'CAT_DB'], file(cat_db)] )
+        : channel.empty()
+
+    cat_db_download_id = "nr"  // NCBI non-redundant protein database identifier
+    def cat_db_id_input = cat_db
+        ? channel.empty()
+        : channel.of( [['id': 'CAT_DB_id'], cat_db_download_id] )
+
+    FASTA_CLASSIFY_CATPACK (
+        RENAME_FASTA_FOR_CATPACK.out.renamed_fasta,  // ch_bins
+        channel.empty(),                             // ch_contigs - empty because we classify bins, not contigs
+        cat_db_input,
+        cat_db_id_input,
+        false,                                       // disable summary generation
+        '.fasta'                                     // bin_suffix - the suffix of the renamed fasta files
+    )
+
+    fasta_updated_with_taxonomy = FASTA_CLASSIFY_CATPACK.out.bat_classification
+        .join(branched_taxonomy_results.genome_taxonomy_input)
+        .map { meta, taxa_tsv, fasta ->
+            def lines = taxa_tsv.readLines()
+            def updated_meta = meta.clone()
+            // support for empty taxonomy files required for -stub mode
+            updated_meta.NCBI_lineage = lines ? lines[1].split('\t')[3] : null
+            return [updated_meta, fasta]
+        }
+        .mix(branched_taxonomy_results.taxonomy_present)
+
+    // --------- Split data to eukaryotes (euk) and prokaryotes (bac and arc)
+    domain_identification = fasta_updated_with_taxonomy
+        .map { meta, fasta ->
+            def lineage = meta.NCBI_lineage
+            def parts   = lineage.tokenize(';').collect { p -> p.trim() }
+            def is_euk  = lineage.contains('ukaryot') || parts.contains('2759')
+            def is_arc  = lineage.contains('rchaea') || parts.contains('2157')
+
+            [ meta + [domain: is_euk ? 'euk' : (is_arc ? 'arc' : 'bac')], fasta ]
+        }
+
+    domain_identification.view()
+
     // --------- For genomes without RNA_presence info, calculate rRNA and tRNA
-    branched_rna_results = fasta_updated_with_coverage
+    branched_rna_results = domain_identification
         .branch { meta, _fasta ->
             rna_prediction_input: meta.RNA_presence == null  // it might be True/False
             rna_present: true  // Everything else goes here
@@ -167,51 +222,10 @@ workflow GENOMESUBMIT {
         }
         .mix(branched_stats_results.evaluation_present)
 
-    // --------- Taxonomy
-    branched_taxonomy_results = fasta_updated_with_stats
-        .branch { meta, _fasta ->
-            genome_taxonomy_input: !(meta.NCBI_lineage)
-            taxonomy_present: true  // Everything else goes here
-        }
-
-    // Change extension for all files required taxonomy to .fasta because CATPACK requires suffix as input
-    RENAME_FASTA_FOR_CATPACK (
-        branched_taxonomy_results.genome_taxonomy_input
-    )
-
-    // build input structures for CAT_DB depending on what provided as input
-    def cat_db_input = cat_db
-        ? channel.of( [['id': 'CAT_DB'], file(cat_db)] )
-        : channel.empty()
-
-    cat_db_download_id = "nr"  // NCBI non-redundant protein database identifier
-    def cat_db_id_input = cat_db
-        ? channel.empty()
-        : channel.of( [['id': 'CAT_DB_id'], cat_db_download_id] )
-
-    FASTA_CLASSIFY_CATPACK (
-        RENAME_FASTA_FOR_CATPACK.out.renamed_fasta,  // ch_bins
-        channel.empty(),                             // ch_contigs - empty because we classify bins, not contigs
-        cat_db_input,
-        cat_db_id_input,
-        false,                                       // disable summary generation
-        '.fasta'                                     // bin_suffix - the suffix of the renamed fasta files
-    )
-
-    fasta_updated_with_taxonomy = FASTA_CLASSIFY_CATPACK.out.bat_classification
-        .join(branched_taxonomy_results.genome_taxonomy_input)
-        .map { meta, taxa_tsv, fasta ->
-            def lines = taxa_tsv.readLines()
-            def updated_meta = meta.clone()
-            // support for empty taxonomy files required for -stub mode
-            updated_meta.NCBI_lineage = lines ? lines[1].split('\t')[3] : null
-            return [updated_meta, fasta]
-        }
-        .mix(branched_taxonomy_results.taxonomy_present)
 
     // --------- Combine metadata into TSV using module
     CREATE_GENOME_METADATA_TSV (
-        fasta_updated_with_taxonomy
+        fasta_updated_with_stats
     )
 
     // Collect all TSV rows into a single file
